@@ -22,8 +22,10 @@ export class TasksService {
   private readonly notionKey = this.configService.get<string>('NOTION_KEY');
   private readonly notionVersion =
     this.configService.get<string>('NOTION_VERSION');
-  private readonly notionDatabaseId =
-    this.configService.get<string>('NOTION_DATABASE_ID');
+  private readonly notionDatabaseId = this.configService.get<string>(
+    'NOTION_DATABASE_DEV_ID',
+  );
+  private readonly serverUrl = this.configService.get<string>('SERVER_URL');
 
   async getPagesByDatabaseId(id: string) {
     const { data } = await firstValueFrom(
@@ -81,7 +83,7 @@ export class TasksService {
         ),
     );
 
-    return data;
+    return data.results ?? [];
   }
 
   downloadImage = async (url: string) => {
@@ -111,23 +113,39 @@ export class TasksService {
     }
   };
 
-  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async handleImageBlock(block) {
+    const imageUrl = block.image.file?.url ?? block.image.external?.url;
+    if (!imageUrl) return;
+    const buff = await this.downloadImage(imageUrl);
+    const hash = createHash('md5').update(buff).digest('hex');
+    await this.writeImage({ fileName: `${hash}.webp`, content: buff });
+  }
+
+  @Cron(CronExpression.EVERY_30_SECONDS)
   async handleCron() {
     const response = await this.getPagesByDatabaseId(this.notionDatabaseId);
     const pageIds = response.results.map((page) => page.id);
     for (const pageId of pageIds) {
-      const response = await this.getBlocksByPageId(pageId);
-      const imageBlocks = (response.results ?? []).filter(
-        (block) => block.type === 'image',
-      );
-      for (const imageBlock of imageBlocks) {
-        const imageUrl =
-          imageBlock.image.file?.url ?? imageBlock.image.external?.url;
-        if (!imageUrl) continue;
-        const buff = await this.downloadImage(imageUrl);
-        const hash = createHash('md5').update(buff).digest('hex');
-        await this.writeImage({ fileName: `${hash}.webp`, content: buff });
-        // TODO: update the new image to notion block
+      const blocks = await this.getBlocksByPageId(pageId);
+      const updatedBlocks = [];
+      for (const block of blocks) {
+        const cloneBlock = { ...block };
+        if (block.type !== 'image') {
+          delete cloneBlock.id;
+          updatedBlocks.push(cloneBlock);
+        }
+        if (block.type === 'image') {
+          // this.handleImageBlock(block);
+          // updatedBlocks.push({
+          //   type: 'image',
+          //   image: {
+          //     type: 'external',
+          //     external: {
+          //       url: `${this.serverUrl}/`,
+          //     },
+          //   },
+          // });
+        }
       }
       this.logger.log(`Write image for page ${pageId} done!`);
     }
