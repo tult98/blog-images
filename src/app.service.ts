@@ -5,8 +5,10 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { AxiosError } from 'axios';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
+import { imageSize } from 'image-size';
 import * as path from 'path';
 import { catchError, firstValueFrom } from 'rxjs';
+import { EXTENSIONS_TO_CONVERT_TO_WEBP } from 'src/utils/constant';
 
 @Injectable()
 export class TasksService {
@@ -57,12 +59,11 @@ export class TasksService {
         )
         .pipe(
           catchError((error: AxiosError) => {
-            this.logger.error(error);
-            throw 'An error happened!';
+            throw error.response.data;
           }),
         ),
     );
-    return data;
+    return data.results ?? [];
   }
 
   async getBlocksByPageId(id) {
@@ -77,8 +78,7 @@ export class TasksService {
         })
         .pipe(
           catchError((error: AxiosError) => {
-            this.logger.error(error);
-            throw 'An error happened!';
+            throw error.response.data;
           }),
         ),
     );
@@ -86,12 +86,37 @@ export class TasksService {
     return data.results ?? [];
   }
 
+  async appendBlockChildren(pageId, data) {
+    const { data: appendedBlocks } = await firstValueFrom(
+      this.httpService
+        .patch(
+          `/blocks/${pageId}/children`,
+          {
+            children: data,
+          },
+          {
+            baseURL: this.notionBaseUrl,
+            headers: {
+              Authorization: `Bearer ${this.notionKey}`,
+              'Notion-Version': this.notionVersion,
+            },
+          },
+        )
+        .pipe(
+          catchError((error: AxiosError) => {
+            throw error.response.data;
+          }),
+        ),
+    );
+
+    return appendedBlocks;
+  }
+
   downloadImage = async (url: string) => {
     const { data } = await firstValueFrom(
       this.httpService.get(url, { responseType: 'arraybuffer' }).pipe(
         catchError((error: AxiosError) => {
-          this.logger.error(error);
-          throw 'An error happened!';
+          throw error.response.data;
         }),
       ),
     );
@@ -109,46 +134,94 @@ export class TasksService {
       const filePath = path.join(__dirname, '..', 'public', fileName);
       fs.writeFileSync(filePath, content);
     } catch (error) {
-      this.logger.error(error);
+      throw error.response.data;
     }
   };
+
+  removeUnnecessaryBlockInfo(block) {
+    delete block.id;
+    delete block.parent;
+    delete block.created_time;
+    delete block.last_edited_time;
+    delete block.last_edited_by;
+    delete block.has_children;
+    delete block.archived;
+    delete block.created_by;
+
+    return block;
+  }
 
   async handleImageBlock(block) {
     const imageUrl = block.image.file?.url ?? block.image.external?.url;
     if (!imageUrl) return;
     const buff = await this.downloadImage(imageUrl);
     const hash = createHash('md5').update(buff).digest('hex');
-    await this.writeImage({ fileName: `${hash}.webp`, content: buff });
+    const imageInfo = imageSize(buff);
+    const fileName = EXTENSIONS_TO_CONVERT_TO_WEBP.includes(imageInfo.type)
+      ? `${hash}.webp`
+      : `${hash}.${imageInfo.type}`;
+    await this.writeImage({ fileName, content: buff });
+
+    return fileName;
+  }
+
+  async deleteBlockById(id) {
+    firstValueFrom(
+      this.httpService
+        .delete(`/blocks/${id}`, {
+          baseURL: this.notionBaseUrl,
+          headers: {
+            Authorization: `Bearer ${this.notionKey}`,
+            'Notion-Version': this.notionVersion,
+          },
+        })
+        .pipe(
+          catchError((error: AxiosError) => {
+            throw error.response.data;
+          }),
+        ),
+    );
   }
 
   @Cron(CronExpression.EVERY_30_SECONDS)
   async handleCron() {
-    const response = await this.getPagesByDatabaseId(this.notionDatabaseId);
-    const pageIds = response.results.map((page) => page.id);
-    for (const pageId of pageIds) {
-      const blocks = await this.getBlocksByPageId(pageId);
-      const updatedBlocks = [];
-      for (const block of blocks) {
-        const cloneBlock = { ...block };
-        if (block.type !== 'image') {
-          delete cloneBlock.id;
-          updatedBlocks.push(cloneBlock);
+    const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
+    for (const page of pages) {
+      try {
+        const blocks = await this.getBlocksByPageId(page.id);
+        const updatedBlocks = [];
+        for (const block of blocks) {
+          if (block.type !== 'image') {
+            const newBlock = this.removeUnnecessaryBlockInfo({ ...block });
+            updatedBlocks.push(newBlock);
+            continue;
+          }
+          const fileName = await this.handleImageBlock(block);
+          updatedBlocks.push({
+            object: 'block',
+            type: 'image',
+            image: {
+              caption: block.image.caption,
+              type: 'external',
+              external: {
+                url: `${this.serverUrl}/${fileName}`,
+              },
+            },
+          });
+          await this.deleteBlockById(block.id);
         }
-        if (block.type === 'image') {
-          // this.handleImageBlock(block);
-          // updatedBlocks.push({
-          //   type: 'image',
-          //   image: {
-          //     type: 'external',
-          //     external: {
-          //       url: `${this.serverUrl}/`,
-          //     },
-          //   },
-          // });
-        }
+
+        await this.appendBlockChildren(page.id, updatedBlocks);
+        this.logger.log(
+          `Finish updating for page: ${
+            page.properties.title.title?.[0]?.plain_text ?? page.id
+          }!`,
+        );
+      } catch (error) {
+        this.logger.error(error);
       }
-      this.logger.log(`Write image for page ${pageId} done!`);
     }
+    this.logger.log('Finish updating for all pages!');
   }
 }
 
