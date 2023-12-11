@@ -8,3 +8,5 @@ export const EXTENSIONS_TO_CONVERT_TO_WEBP: string[] = [
   'cur',
   'avif',
 ];
+
+export const RETRY_TIMES = 3;

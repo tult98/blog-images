@@ -4,17 +4,17 @@ import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { AxiosError } from 'axios';
 import { createHash } from 'crypto';
-import * as fs from 'fs';
 import { imageSize } from 'image-size';
-import * as path from 'path';
 import { catchError, firstValueFrom } from 'rxjs';
-import { EXTENSIONS_TO_CONVERT_TO_WEBP } from 'src/utils/constant';
+import { S3Service } from 'src/s3.service';
+import { EXTENSIONS_TO_CONVERT_TO_WEBP, RETRY_TIMES } from 'src/utils/constant';
 
 @Injectable()
 export class TasksService {
   constructor(
     private configService: ConfigService,
     private readonly httpService: HttpService,
+    private readonly s3Service: S3Service,
   ) {}
 
   private readonly logger = new Logger(TasksService.name);
@@ -24,10 +24,10 @@ export class TasksService {
   private readonly notionKey = this.configService.get<string>('NOTION_KEY');
   private readonly notionVersion =
     this.configService.get<string>('NOTION_VERSION');
-  private readonly notionDatabaseId = this.configService.get<string>(
-    'NOTION_DATABASE_DEV_ID',
-  );
-  private readonly serverUrl = this.configService.get<string>('SERVER_URL');
+  private readonly notionDatabaseId =
+    this.configService.get<string>('NOTION_DATABASE_ID');
+  // s3
+  private readonly imageDomain = this.configService.get<string>('IMAGE_DOMAIN');
 
   async getPagesByDatabaseId(id: string) {
     const { data } = await firstValueFrom(
@@ -123,21 +123,6 @@ export class TasksService {
     return data;
   }
 
-  async writeImage({
-    fileName,
-    content,
-  }: {
-    fileName: string;
-    content: string;
-  }) {
-    try {
-      const filePath = path.resolve(process.cwd(), 'public', fileName);
-      fs.writeFileSync(filePath, content);
-    } catch (error) {
-      throw error.response.data;
-    }
-  }
-
   removeUnnecessaryBlockInfo(block) {
     delete block.id;
     delete block.parent;
@@ -152,17 +137,25 @@ export class TasksService {
   }
 
   async handleImageBlock(block) {
-    const imageUrl = block.image.file?.url ?? block.image.external?.url;
-    if (!imageUrl) return;
-    const buff = await this.downloadImage(imageUrl);
-    const hash = createHash('md5').update(buff).digest('hex');
-    const imageInfo = imageSize(buff);
-    const fileName = EXTENSIONS_TO_CONVERT_TO_WEBP.includes(imageInfo.type)
-      ? `${hash}.webp`
-      : `${hash}.${imageInfo.type}`;
-    await this.writeImage({ fileName, content: buff });
+    let retryCount = 0;
+    while (retryCount < RETRY_TIMES) {
+      try {
+        const imageUrl = block.image.file?.url ?? block.image.external?.url;
+        if (!imageUrl) return;
+        const buff = await this.downloadImage(imageUrl);
+        const hash = createHash('md5').update(buff).digest('hex');
+        const imageInfo = imageSize(buff);
+        const fileName = EXTENSIONS_TO_CONVERT_TO_WEBP.includes(imageInfo.type)
+          ? `${hash}.webp`
+          : `${hash}.${imageInfo.type}`;
+        await this.s3Service.uploadObject(fileName, buff);
 
-    return fileName;
+        return { fileName, imageInfo };
+      } catch (error) {
+        retryCount++;
+        this.logger.error(`Failed at upload image to S3: ${retryCount} times`);
+      }
+    }
   }
 
   async deleteBlockById(id) {
@@ -183,44 +176,51 @@ export class TasksService {
     );
   }
 
+  async updateBlocksOfPage(page: any) {
+    try {
+      const blocks = await this.getBlocksByPageId(page.id);
+      const updatedBlocks = [];
+      for (const block of blocks) {
+        if (block.type !== 'image') {
+          const newBlock = this.removeUnnecessaryBlockInfo({ ...block });
+          updatedBlocks.push(newBlock);
+          continue;
+        }
+        const { fileName, imageInfo } = await this.handleImageBlock(block);
+        updatedBlocks.push({
+          object: 'block',
+          type: 'image',
+          image: {
+            caption: block.image.caption,
+            type: 'external',
+            external: {
+              url: `${this.imageDomain}/${fileName}?w=${imageInfo.width}&h=${imageInfo.height}`,
+            },
+          },
+        });
+        await this.deleteBlockById(block.id);
+      }
+
+      await this.appendBlockChildren(page.id, updatedBlocks);
+      this.logger.log(
+        `Finish updating for page: ${
+          page.properties.title.title?.[0]?.plain_text ?? page.id
+        }!`,
+      );
+    } catch (error) {
+      this.logger.error('Failed at updateBlocksByPageId');
+      this.logger.error(error);
+    }
+  }
+
   @Cron(CronExpression.EVERY_30_SECONDS)
   async handleCron() {
     const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
+    const promises = [];
     for (const page of pages) {
-      try {
-        const blocks = await this.getBlocksByPageId(page.id);
-        const updatedBlocks = [];
-        for (const block of blocks) {
-          if (block.type !== 'image') {
-            const newBlock = this.removeUnnecessaryBlockInfo({ ...block });
-            updatedBlocks.push(newBlock);
-            continue;
-          }
-          const fileName = await this.handleImageBlock(block);
-          updatedBlocks.push({
-            object: 'block',
-            type: 'image',
-            image: {
-              caption: block.image.caption,
-              type: 'external',
-              external: {
-                url: `${this.serverUrl}/${fileName}`,
-              },
-            },
-          });
-          await this.deleteBlockById(block.id);
-        }
-
-        await this.appendBlockChildren(page.id, updatedBlocks);
-        this.logger.log(
-          `Finish updating for page: ${
-            page.properties.title.title?.[0]?.plain_text ?? page.id
-          }!`,
-        );
-      } catch (error) {
-        this.logger.error(error);
-      }
+      promises.push(this.updateBlocksOfPage(page));
     }
+    await Promise.all(promises);
     this.logger.log('Finish updating for all pages!');
   }
 }
