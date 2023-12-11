@@ -213,7 +213,7 @@ export class TasksService {
     }
   }
 
-  @Cron(CronExpression.EVERY_30_SECONDS)
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
   async handleCron() {
     const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
     const promises = [];
