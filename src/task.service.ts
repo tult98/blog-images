@@ -36,10 +36,20 @@ export class TasksService {
           `/databases/${id}/query`,
           {
             filter: {
-              property: 'is_published',
-              checkbox: {
-                equals: true,
-              },
+              and: [
+                {
+                  property: 'is_published',
+                  checkbox: {
+                    equals: true,
+                  },
+                },
+                {
+                  property: 'is_updated',
+                  checkbox: {
+                    equals: false,
+                  },
+                },
+              ],
             },
             sorts: [
               {
@@ -159,7 +169,7 @@ export class TasksService {
   }
 
   async deleteBlockById(id) {
-    firstValueFrom(
+    const { data } = await firstValueFrom(
       this.httpService
         .delete(`/blocks/${id}`, {
           baseURL: this.notionBaseUrl,
@@ -174,6 +184,38 @@ export class TasksService {
           }),
         ),
     );
+
+    return data;
+  }
+
+  async markPageAsUpdated(pageId) {
+    const { data } = await firstValueFrom(
+      this.httpService
+        .patch(
+          `/pages/${pageId}`,
+          {
+            properties: {
+              is_updated: { checkbox: true },
+            },
+          },
+          {
+            baseURL: this.notionBaseUrl,
+            headers: {
+              Authorization: `Bearer ${this.notionKey}`,
+              'Notion-Version': this.notionVersion,
+              'Content-Type': 'application/json',
+            },
+          },
+        )
+        .pipe(
+          catchError((error: AxiosError) => {
+            this.logger.error('Failed at markPageAsUpdated');
+            throw error.response.data;
+          }),
+        ),
+    );
+
+    return data;
   }
 
   async updateBlocksOfPage(page: any) {
@@ -202,13 +244,15 @@ export class TasksService {
       }
 
       await this.appendBlockChildren(page.id, updatedBlocks);
+      await this.markPageAsUpdated(page.id);
+
       this.logger.log(
         `Finish updating for page: ${
           page.properties.title.title?.[0]?.plain_text ?? page.id
         }!`,
       );
     } catch (error) {
-      this.logger.error('Failed at updateBlocksByPageId');
+      this.logger.error('Failed at updateBlocksByPage');
       this.logger.error(error);
     }
   }
