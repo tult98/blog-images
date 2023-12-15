@@ -2,6 +2,7 @@ import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { RateLimit } from 'async-sema';
 import { AxiosError } from 'axios';
 import { createHash } from 'crypto';
 import { imageSize } from 'image-size';
@@ -29,71 +30,109 @@ export class TasksService {
   // s3
   private readonly imageDomain = this.configService.get<string>('IMAGE_DOMAIN');
 
+  private readonly rateLimiter = RateLimit(1, {
+    timeUnit: 2000,
+    uniformDistribution: true,
+  });
+
   async getPagesByDatabaseId(id: string) {
-    const { data } = await firstValueFrom(
-      this.httpService
-        .post(
-          `/databases/${id}/query`,
-          {
-            filter: {
-              and: [
-                {
-                  property: 'is_published',
-                  checkbox: {
-                    equals: true,
+    let pages = [];
+    let hasMore = true;
+    let startCursor = null;
+
+    while (hasMore) {
+      await this.rateLimiter();
+      const bodyParams = startCursor
+        ? { page_size: 100, start_cursor: startCursor }
+        : { page_size: 100 };
+
+      const { data } = await firstValueFrom(
+        this.httpService
+          .post(
+            `/databases/${id}/query`,
+            {
+              ...bodyParams,
+              filter: {
+                and: [
+                  {
+                    property: 'is_published',
+                    checkbox: {
+                      equals: true,
+                    },
                   },
-                },
-                {
-                  property: 'is_updated',
-                  checkbox: {
-                    equals: false,
+                  {
+                    property: 'is_updated',
+                    checkbox: {
+                      equals: false,
+                    },
                   },
+                ],
+              },
+              sorts: [
+                {
+                  property: 'published_at',
+                  direction: 'descending',
                 },
               ],
             },
-            sorts: [
-              {
-                property: 'published_at',
-                direction: 'descending',
+            {
+              baseURL: this.notionBaseUrl,
+              headers: {
+                Authorization: `Bearer ${this.notionKey}`,
+                'Notion-Version': this.notionVersion,
+                'Content-Type': 'application/json',
               },
-            ],
-          },
-          {
+            },
+          )
+          .pipe(
+            catchError((error: AxiosError) => {
+              throw error.response.data;
+            }),
+          ),
+      );
+
+      pages = [...pages, ...data.results];
+      hasMore = data.has_more;
+      startCursor = data.next_cursor;
+    }
+
+    return pages;
+  }
+
+  async getBlocksByPageId(id) {
+    let blocks = [];
+    let hasMore = true;
+    let startCursor = null;
+
+    while (hasMore) {
+      let queryParams = 'page_size=100';
+      if (startCursor) {
+        queryParams += `&start_cursor=${startCursor}`;
+      }
+
+      const { data } = await firstValueFrom(
+        this.httpService
+          .get(`/blocks/${id}/children?${queryParams}`, {
             baseURL: this.notionBaseUrl,
             headers: {
               Authorization: `Bearer ${this.notionKey}`,
               'Notion-Version': this.notionVersion,
-              'Content-Type': 'application/json',
             },
-          },
-        )
-        .pipe(
-          catchError((error: AxiosError) => {
-            throw error.response.data;
-          }),
-        ),
-    );
-    return data.results ?? [];
-  }
+          })
+          .pipe(
+            catchError((error: AxiosError) => {
+              this.logger.error('Failed at getBlocksByPageId');
+              throw error.response.data;
+            }),
+          ),
+      );
 
-  async getBlocksByPageId(id) {
-    const { data } = await firstValueFrom(
-      this.httpService
-        .get(`/blocks/${id}/children?page_size=100`, {
-          baseURL: this.notionBaseUrl,
-          headers: {
-            Authorization: `Bearer ${this.notionKey}`,
-            'Notion-Version': this.notionVersion,
-          },
-        })
-        .pipe(
-          catchError((error: AxiosError) => {
-            throw error.response.data;
-          }),
-        ),
-    );
+      blocks = [...blocks, ...data.results];
+      hasMore = data.has_more;
+      startCursor = data.next_cursor;
+    }
 
-    return data.results ?? [];
+    return blocks;
   }
 
   async appendBlockChildren(pageId, data) {
@@ -114,6 +153,7 @@ export class TasksService {
         )
         .pipe(
           catchError((error: AxiosError) => {
+            this.logger.error('Failed at appendBlockChildren');
             throw error.response.data;
           }),
         ),
@@ -180,6 +220,7 @@ export class TasksService {
         })
         .pipe(
           catchError((error: AxiosError) => {
+            this.logger.error('Failed at deleteBlockById');
             throw error.response.data;
           }),
         ),
@@ -240,10 +281,26 @@ export class TasksService {
             },
           },
         });
-        await this.deleteBlockById(block.id);
       }
 
-      await this.appendBlockChildren(page.id, updatedBlocks);
+      // delete all blocks
+      await Promise.all(
+        blocks.map(async (block) => {
+          await this.rateLimiter();
+          return this.deleteBlockById(block.id);
+        }),
+      );
+
+      // append new blocks
+      const updatedBlocksChunks = [];
+      while (updatedBlocks.length > 0) {
+        updatedBlocksChunks.push(updatedBlocks.splice(0, 100));
+      }
+      for (const blocksChunk of updatedBlocksChunks) {
+        await this.rateLimiter();
+        await this.appendBlockChildren(page.id, blocksChunk);
+      }
+
       await this.markPageAsUpdated(page.id);
 
       this.logger.log(
@@ -259,12 +316,18 @@ export class TasksService {
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
   async handleCron() {
-    const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
-    const promises = [];
-    for (const page of pages) {
-      promises.push(this.updateBlocksOfPage(page));
+    try {
+      const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
+      await Promise.all(
+        pages.map(async (page) => {
+          await this.rateLimiter();
+          return this.updateBlocksOfPage(page);
+        }),
+      );
+      this.logger.log('Finish updating for all pages!');
+    } catch (error) {
+      this.logger.error('Failed at handleCron');
+      this.logger.error(error);
     }
-    await Promise.all(promises);
-    this.logger.log('Finish updating for all pages!');
   }
 }
