@@ -314,7 +314,25 @@ export class TasksService {
     }
   }
 
-  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async updateAllPages() {
+    try {
+      const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
+      await Promise.all(
+        pages.map(async (page) => {
+          await this.rateLimiter();
+          return this.updateBlocksOfPage(page);
+        }),
+      );
+      this.logger.log('Finish updating for all pages!');
+    } catch (error) {
+      this.logger.error('Failed at handleCron');
+      this.logger.error(error);
+    }
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_2AM, {
+    name: 'updateAllPages',
+  })
   async handleCron() {
     try {
       const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
