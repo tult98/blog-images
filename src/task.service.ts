@@ -9,6 +9,7 @@ import { imageSize } from 'image-size';
 import { catchError, firstValueFrom } from 'rxjs';
 import { S3Service } from 'src/s3.service';
 import { EXTENSIONS_TO_CONVERT_TO_WEBP, RETRY_TIMES } from 'src/utils/constant';
+import { getMimeType } from 'src/utils/file';
 
 @Injectable()
 export class TasksService {
@@ -195,17 +196,29 @@ export class TasksService {
         const buff = await this.downloadImage(imageUrl);
         const hash = createHash('md5').update(buff).digest('hex');
         const imageInfo = imageSize(buff);
-        const fileName = EXTENSIONS_TO_CONVERT_TO_WEBP.includes(imageInfo.type)
+
+        const mimeType = getMimeType(imageInfo.type);
+        const shouldConvert = EXTENSIONS_TO_CONVERT_TO_WEBP.includes(
+          imageInfo.type,
+        );
+        const fileName = shouldConvert
           ? `${hash}.webp`
           : `${hash}.${imageInfo.type}`;
-        await this.s3Service.uploadObject(fileName, buff);
+        await this.s3Service.uploadObject(
+          fileName,
+          buff,
+          shouldConvert ? 'image/webp' : mimeType,
+        );
 
         return { fileName, imageInfo };
       } catch (error) {
         retryCount++;
         this.logger.error(`Failed at upload image to S3: ${retryCount} times`);
+        this.logger.error(error);
       }
     }
+    // failed to upload image
+    return {};
   }
 
   async deleteBlockById(id) {
@@ -277,7 +290,9 @@ export class TasksService {
             caption: block.image.caption,
             type: 'external',
             external: {
-              url: `${this.imageDomain}/${fileName}?w=${imageInfo.width}&h=${imageInfo.height}`,
+              url: `${this.imageDomain}/${fileName}?w=${
+                imageInfo?.width ?? 0
+              }&h=${imageInfo?.height ?? 0}`,
             },
           },
         });
@@ -314,7 +329,25 @@ export class TasksService {
     }
   }
 
-  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async updateAllPages() {
+    try {
+      const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
+      await Promise.all(
+        pages.map(async (page) => {
+          await this.rateLimiter();
+          return this.updateBlocksOfPage(page);
+        }),
+      );
+      this.logger.log('Finish updating for all pages!');
+    } catch (error) {
+      this.logger.error('Failed at handleCron');
+      this.logger.error(error);
+    }
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_2AM, {
+    name: 'updateAllPages',
+  })
   async handleCron() {
     try {
       const pages = await this.getPagesByDatabaseId(this.notionDatabaseId);
