@@ -22,12 +22,11 @@ export class AppController {
     const job = new CronJob(`${30} * * * * *`, () => {
       this.taskService.updateAllPages();
     });
-    this.schedulerRegistry.addCronJob('updateAllPages', job);
+    job.addCallback(() => {
+      this.schedulerRegistry.deleteCronJob('updateAllPagesManually');
+    });
+    this.schedulerRegistry.addCronJob('updateAllPagesManually', job);
     job.start();
-
-    setTimeout(() => {
-      this.schedulerRegistry.deleteCronJob('updateAllPages');
-    }, 40000);
 
     return 'Processing...';
   }

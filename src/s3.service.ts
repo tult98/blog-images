@@ -16,11 +16,12 @@ export class S3Service {
 
   constructor(private configService: ConfigService) {}
 
-  async uploadObject(fileName: string, body: any) {
+  async uploadObject(fileName: string, body: any, mimeType: string) {
     const command = new PutObjectCommand({
       Bucket: this.bucket,
       Key: fileName,
       Body: body,
+      ContentType: mimeType,
     });
 
     try {
