@@ -19,7 +19,7 @@ export class AppController {
 
   @Get('update-all-pages')
   async updateAllPages() {
-    const job = new CronJob(`${30} * * * * *`, () => {
+    const job = new CronJob('30 * * * * *', () => {
       this.taskService.updateAllPages();
     });
     job.addCallback(() => {
